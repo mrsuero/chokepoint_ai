@@ -5,3 +5,4 @@ chokepoint_metrics.json
 agent_ui_state.json
 venv/
 .venv/
+frontend_ui/node_modules/
