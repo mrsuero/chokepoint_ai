@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+chokepoint_metrics.json
+agent_ui_state.json
+venv/
+.venv/
