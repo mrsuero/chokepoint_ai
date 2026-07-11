@@ -12,6 +12,7 @@ export default function App() {
   // System states
   const [currentRole, setCurrentRole] = useState('OPERATOR');
   const [systemState, setSystemState] = useState(null);
+  const [metricsState, setMetricsState] = useState(null);
   const [frameTick, setFrameTick] = useState(0);
 
   // Poll system data structure context
@@ -19,10 +20,17 @@ export default function App() {
     if (!isAuthenticated) return;
     const fetchSystemState = async () => {
       try {
-        const response = await fetch('/agent_ui_state.json');
-        const data = await response.json();
-        setSystemState(data);
-        if (data.severity) {
+        const [stateResponse, metricsResponse] = await Promise.all([
+          fetch('/agent_ui_state.json'),
+          fetch('/chokepoint_metrics.json'),
+        ]);
+        const stateData = await stateResponse.json();
+        const metricsData = await metricsResponse.json();
+
+        setSystemState(stateData);
+        setMetricsState(metricsData);
+
+        if (stateData.severity) {
           // Sync role securely with backend recommendations if preferred
         }
       } catch (error) {
@@ -115,6 +123,10 @@ export default function App() {
   }
 
   // --- CORE DASHBOARD LAYER ---
+  const isUrgentState = systemState.severity === 'CRITICAL' || systemState.severity === 'WARNING' || systemState.dispatch_mode === 'MANUAL_PENDING';
+  const alertTitle = systemState?.admin_view?.pop_up_title || systemState?.operator_view?.banner || 'SYSTEM NOTICE';
+  const alertBody = systemState?.admin_view?.description || systemState?.admin_view?.log_summary || systemState?.operator_view?.instruction || 'Monitoring live telemetry.';
+
   return (
     <div className="min-h-screen w-full bg-slate-900 text-slate-100 font-sans antialiased">
       <header className="flex items-center justify-between border-b border-slate-800 bg-slate-950 px-6 py-3">
@@ -134,6 +146,35 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {isUrgentState && (
+        <div className={`mx-6 mt-4 rounded-lg border px-4 py-3 shadow-lg ${
+          systemState.severity === 'CRITICAL' || systemState.dispatch_mode === 'MANUAL_PENDING'
+            ? 'border-red-900 bg-red-950/40'
+            : 'border-amber-900 bg-amber-950/30'
+        }`}>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className={`text-[10px] font-mono uppercase tracking-[0.3em] ${
+                systemState.severity === 'CRITICAL' || systemState.dispatch_mode === 'MANUAL_PENDING'
+                  ? 'text-red-300'
+                  : 'text-amber-300'
+              }`}>
+                Live Incident Alert
+              </div>
+              <div className="mt-1 text-sm font-mono font-bold text-slate-100">{alertTitle}</div>
+              <div className="mt-1 text-sm font-mono text-slate-300">{alertBody}</div>
+            </div>
+            <div className={`shrink-0 rounded border px-3 py-1 text-xs font-mono font-bold uppercase ${
+              systemState.severity === 'CRITICAL' || systemState.dispatch_mode === 'MANUAL_PENDING'
+                ? 'border-red-800 text-red-300 bg-red-950/40'
+                : 'border-amber-800 text-amber-300 bg-amber-950/30'
+            }`}>
+              {systemState.severity}
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left 2 Columns: Live Video Analytics Monitor */}
@@ -156,7 +197,7 @@ export default function App() {
               {/* Geometric AI Overlay Markers if incident triggers */}
               {systemState.severity === 'WARNING' && (
                 <div className="absolute top-4 left-4 border-2 border-amber-500 bg-amber-950/70 p-2 rounded font-mono text-xs text-amber-400 animate-pulse">
-                  ⚠️ DETECTION: LUGGAGE ANOMALY AT WORKSTATION ZONE 2
+                  ⚠️ DETECTION: SUSPECTED LUGGAGE DISPUTE AT WORKSTATION ZONE 1
                 </div>
               )}
               {systemState.severity === 'CRITICAL' && (
@@ -171,9 +212,9 @@ export default function App() {
         {/* Right Column: AI Insights & Directives */}
         <div className="space-y-6">
           {currentRole === 'OPERATOR' ? (
-            <OperatorDashboard viewData={systemState.operator_view} severity={systemState.severity} />
+            <OperatorDashboard viewData={systemState.operator_view} severity={systemState.severity} metricsData={metricsState} />
           ) : (
-            <AdminDashboard viewData={systemState.admin_view} severity={systemState.severity} dispatchMode={systemState.dispatch_mode} />
+            <AdminDashboard viewData={systemState.admin_view} severity={systemState.severity} dispatchMode={systemState.dispatch_mode} metricsData={metricsState} />
           )}
         </div>
       </main>

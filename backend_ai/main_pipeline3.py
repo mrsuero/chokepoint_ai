@@ -29,17 +29,17 @@ FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame.j
 
 # === TOẠ ĐỘ ZONE (đã calibrate thực tế bằng get_coords.py) ===
 ZONE_1_SOURCE = np.array([
-    [198, 246],  # Top-Left (1)
-    [610, 249],  # Top-Right (2)
-    [612, 349],  # Bottom-Right (3)
-    [154, 337]   # Bottom-Left (4)
+    [188, 158],  # Top-Left (1)
+    [356, 162],  # Top-Right (2)
+    [363, 286],  # Bottom-Right (3)
+    [124, 282]   # Bottom-Left (4)
 ], np.int32)  # Zone 1 - khu vực xếp hàng chờ để vô làm thủ tục
 
 ZONE_2_SOURCE = np.array([
-    [357, 257],  # Top-Left (1)
-    [358, 206],  # Top-Right (2)
-    [756, 203],  # Bottom-Right (3)
-    [740, 253]   # Bottom-Left (4)
+    [364, 166],  # Top-Left (1)
+    [420, 166],  # Top-Right (2)
+    [482, 289],  # Bottom-Right (3)
+    [373, 287]   # Bottom-Left (4)
 ], np.int32)  # Zone 2 - khu vực làm thủ tục tại quầy
 
 LUGGAGE_LABELS = {"backpack", "handbag", "suitcase"}
@@ -170,7 +170,7 @@ def run_simulation_loop():
         cv2.imwrite(FRAME_OUTPUT_PATH, frame_copy)
         time.sleep(1)
 
-def run_vision_pipeline(video_source="video1.mp4"):
+def run_vision_pipeline(video_source="video3.mp4"):
     global TOTAL_PASSENGERS_ENTERED
 
     # Cơ chế tự động quét thông minh: Check thư mục hiện tại trước, nếu không thấy thì check thư mục cha

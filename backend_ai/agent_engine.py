@@ -7,6 +7,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+try:
+    from langfuse import Langfuse
+except Exception:
+    Langfuse = None
+
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -15,6 +20,21 @@ if not API_KEY:
     sys.exit(1)
 
 client = genai.Client(api_key=API_KEY)
+langfuse_client = None
+
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
+if Langfuse and LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY:
+    try:
+        langfuse_client = Langfuse(
+            public_key=LANGFUSE_PUBLIC_KEY,
+            secret_key=LANGFUSE_SECRET_KEY,
+            host=LANGFUSE_HOST,
+        )
+    except Exception as error:
+        print(f"[WARN] Langfuse init skipped: {error}")
 CRITICAL_TICKET_START_TIME = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,15 +78,29 @@ def call_gemini_agent_decision(metrics_payload):
         "Operational Thresholds:\n"
         "- Severity NOMINAL: Default state when wait times and density are low.\n"
         "- Severity MINIMAL (AUTO Mode): Triggered if wait time is between 5 and 12 minutes.\n"
-        "- Severity WARNING (MANUAL Mode): Triggered if a LUGGAGE_DISPUTE is flagged OR if processing time is rising non-stop.\n"
+        "- Severity WARNING (MANUAL Mode): Triggered if a SUSPECTED_LUGGAGE_DISPUTE is flagged OR if processing time is rising non-stop.\n"
         "- Severity CRITICAL (MANUAL_PENDING Mode): Triggered if a MEDICAL_EMERGENCY is active or wait time equals/exceeds 12 minutes."
     )
 
     user_content = f"Current Terminal Telemetry Data Context:\n{json.dumps(metrics_payload, indent=2)}"
 
+    trace = None
+    if langfuse_client:
+        try:
+            trace = langfuse_client.trace(
+                name="chokepoint-agent-decision",
+                metadata={
+                    "dispatch_target": "airport_checkpoint",
+                    "model": "gemini-3-flash-preview",
+                },
+                input=metrics_payload,
+            )
+        except Exception as error:
+            print(f"[WARN] Langfuse trace creation skipped: {error}")
+
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             contents=user_content,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -87,9 +121,24 @@ def call_gemini_agent_decision(metrics_payload):
                 ),
             ),
         )
-        return json.loads(response.text)
+        decision = json.loads(response.text)
+
+        if trace:
+            try:
+                trace.update(output=decision)
+                trace.end()
+            except Exception as error:
+                print(f"[WARN] Langfuse trace update skipped: {error}")
+
+        return decision
     except Exception as error:
         print(f"[LLM INFERENCE ERROR] Failed to parse agent decision: {error}")
+        if trace:
+            try:
+                trace.update(output={"error": str(error)})
+                trace.end(status_message="error")
+            except Exception:
+                pass
         return None
 
 
