@@ -5,166 +5,264 @@ import json
 import os
 from ultralytics import YOLO
 
-# =====================================================================
-# CONFIGURATION & GLOBAL REGISTRIES
-# =====================================================================
-# Initialize lightweight YOLOv11 nano model for tracking
-MODEL = YOLO("yolov11n.pt")
+# Global model initialization
+try:
+    MODEL = YOLO("yolo11n.pt")
+    print(f"[DEBUG] YOLO model loaded successfully: {MODEL}")
+except Exception as e:
+    print(f"[ERROR] Failed to load YOLO model: {e}")
+    MODEL = None
 
-# ROI Polygons (Assumed 1280x720 frame coordinates)
-ZONE_1_QUEUE = np.array([[100, 350], [500, 350], [500, 700], [100, 700]], np.int32)
-ZONE_2_COUNTER = np.array([[520, 350], [900, 350], [900, 700], [520, 700]], np.int32)
-
-# Registries to track passenger timestamps
-# Structure: { passenger_id: { "enter_z1": ts, "exit_z1": ts, "exit_z2": ts } }
+# Runtime tracking data structures
 PASSENGER_REGISTRY = {}
-
-# Historical buffers for SLA calculation (stored in minutes)
 HISTORICAL_WAIT_TIMES = []
 HISTORICAL_PROCESSING_TIMES = []
-
-# Buffer to monitor processing time trend (stores last 3 average processing times)
 PROC_TIME_TREND_BUFFER = []
 
-# Accumulation rate metrics
+# Statistical initial states
 TOTAL_PASSENGERS_ENTERED = 0
 SYSTEM_START_TIME = time.time()
 
-# =====================================================================
-# HELPER FUNCTIONS
-# =====================================================================
+# Target data paths directly inside the Frontend public repository
+OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
+FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame.jpg")
+
+# Toạ độ thực tế đã được calibrate trực tiếp trên khung hình video (Zone 2 - khu vực quầy check-in)
+# Thứ tự: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+ZONE_2_SOURCE = np.array([
+    [2, 430],  # Top-Left (1)
+    [118, 429],  # Top-Right (2)
+    [637, 77],  # Bottom-Right (3)
+    [536, 49],   # Bottom-Left (4)
+    [3, 305]    # Bottom-Left (5)
+], np.int32)
+
+def get_dynamic_zones(frame_width, frame_height):
+    """
+    Zone 2 (quầy check-in) dùng toạ độ pixel thực đã calibrate sẵn (ZONE_2_SOURCE).
+    Zone 1 (khu xếp hàng chờ) = toàn bộ phần diện tích CÒN LẠI của khung hình,
+    được tính chính xác bằng mask subtraction (frame - zone_2), không suy đoán qua %.
+    """
+    zone_2 = ZONE_2_SOURCE
+
+    # Tạo mask toàn khung hình (trắng hết)
+    full_frame_mask = np.full((frame_height, frame_width), 255, dtype=np.uint8)
+
+    # Tạo mask riêng cho zone_2 rồi tô đầy polygon
+    zone_2_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+    cv2.fillPoly(zone_2_mask, [zone_2], 255)
+
+    # Trừ đi zone_2 khỏi toàn khung hình -> phần còn lại chính là zone_1
+    zone_1_mask = cv2.subtract(full_frame_mask, zone_2_mask)
+
+    # Lấy contour bao quanh phần diện tích còn lại để làm polygon zone_1
+    contours, _ = cv2.findContours(zone_1_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest_contour = max(contours, key=cv2.contourArea)
+    zone_1 = largest_contour.reshape(-1, 2).astype(np.int32)
+
+    # Đường ranh giới ảo (dùng cạnh phải của zone_2 làm mốc tương đối để vẽ minh hoạ)
+    divider_x = int(np.max(zone_2[:, 0]))
+
+    return zone_1, zone_2, divider_x
+
 def is_inside_zone(point, polygon_zone):
     """
-    Checks if a specific coordinate point (x, y) falls inside a predefined ROI polygon.
+    Evaluates point polygon inclusion test to check if coordinate matches target ROI.
     """
     return cv2.pointPolygonTest(polygon_zone, point, False) >= 0
 
-
 def calculate_accumulation_rate(current_time):
     """
-    Calculates the passenger accumulation rate per minute.
-    Formula: (Total Entered - Total Exited Zone 1) / Elapsed Minutes
+    Calculates the linear passenger inflow accumulation delta per minute.
     """
     elapsed_minutes = (current_time - SYSTEM_START_TIME) / 60
     total_exited_z1 = len(HISTORICAL_WAIT_TIMES)
-    
     if elapsed_minutes > 0:
         return (TOTAL_PASSENGERS_ENTERED - total_exited_z1) / elapsed_minutes
     return 0.0
 
-
 def analyze_processing_trend(current_avg_proc):
     """
-    Analyzes the derivative/direction of processing time over the last 3 monitoring cycles.
-    Determines if the bottleneck is compounding or stabilizing.
+    Tracks historical data derivatives over 3 data steps to verify monotonic expansion.
     """
     global PROC_TIME_TREND_BUFFER
     PROC_TIME_TREND_BUFFER.append(current_avg_proc)
-    
-    # Keep only the latest 3 cycles for trend analysis
     if len(PROC_TIME_TREND_BUFFER) > 3:
         PROC_TIME_TREND_BUFFER.pop(0)
-        
     if len(PROC_TIME_TREND_BUFFER) < 3:
         return "STABLE", 0
-        
-    # Check for continuous upward trend: cycle_1 < cycle_2 < cycle_3
     if PROC_TIME_TREND_BUFFER[0] < PROC_TIME_TREND_BUFFER[1] < PROC_TIME_TREND_BUFFER[2]:
         return "INCREASING_NON_STOP", 3
-        
     return "STABLE", 0
-
 
 def mock_ocr_weight_sensor():
     """
-    Simulates a non-invasive OCR camera reading the digital scale screen.
-    Returns excessive weight occasionally to simulate baggage disputes for evaluation.
+    Simulates operational weight metrics generated via independent screen character extraction.
     """
-    # Simulate a scenario where luggage is overweight (e.g., 26.5 kg > 20 kg standard allowance)
-    if time.time() % 30 < 5: 
+    if time.time() % 30 < 5:
         return 26.5
     return 12.2
 
-# =====================================================================
-# TRUCK 1 & 2: CV PROCESSING & MATHEMATICAL METRICS PIPELINE
-# =====================================================================
+def run_simulation_loop():
+    """
+    Fallback loop executing mathematical generation if no source video asset is found.
+    Generates dummy frames to ensure the frontend image stream works properly.
+    """
+    print("[SYSTEM NOTICE] Entering dynamic vision simulation mode due to missing video source asset.")
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+    # Create a base dark canvas for web preview fallback simulation
+    sim_frame = np.zeros((540, 960, 3), dtype=np.uint8)
+
+    while True:
+        current_time = time.time()
+        elapsed = current_time - SYSTEM_START_TIME
+
+        current_queue_density = 8 + int(np.sin(elapsed / 10) * 4)
+        simulated_wait = 4.5 + (elapsed * 0.05)
+        simulated_proc = 2.5 + (elapsed * 0.02)
+
+        trend_status = "STABLE"
+        trend_cycles = 0
+        if elapsed > 30:
+            trend_status = "INCREASING_NON_STOP"
+            trend_cycles = 3
+
+        detected_incident = None
+        if simulated_wait >= 12.0:
+            detected_incident = "MEDICAL_EMERGENCY"
+        elif elapsed > 20 and elapsed <= 35:
+            detected_incident = "LUGGAGE_DISPUTE"
+
+        metrics_payload = {
+            "current_queue_density": max(0, current_queue_density),
+            "avg_wait_time_minutes": round(simulated_wait, 1),
+            "avg_processing_time_minutes": round(simulated_proc, 1),
+            "accumulation_rate_per_min": round(0.5 + (current_queue_density * 0.1), 2),
+            "trend_analysis": {
+                "proc_time_slope": trend_status,
+                "consecutive_cycles_of_increase": trend_cycles
+            },
+            "trigger_incident": detected_incident,
+            "system_timestamp": current_time
+        }
+
+        with open(OUTPUT_PATH, "w") as f:
+            json.dump(metrics_payload, f, indent=4)
+
+        # Draw dynamic canvas details for web display testing
+        frame_copy = sim_frame.copy()
+        cv2.putText(frame_copy, f"SIMULATION FEED RUNNING - TIME: {int(elapsed)}s", (50, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2)
+        cv2.putText(frame_copy, f"DENSITY TARGET: {current_queue_density} PAX", (50, 260),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        if detected_incident:
+            cv2.putText(frame_copy, f"ALERT: {detected_incident}", (50, 320),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        cv2.imwrite(FRAME_OUTPUT_PATH, frame_copy)
+        time.sleep(1)
+
 def run_vision_pipeline(video_source="airport_mock.mp4"):
     global TOTAL_PASSENGERS_ENTERED
+
+    # Cơ chế tự động quét thông minh: Check thư mục hiện tại trước, nếu không thấy thì check thư mục cha
+    original_source = video_source
+    if not os.path.exists(video_source):
+        fallback_path = os.path.join("..", video_source)
+        if os.path.exists(fallback_path):
+            video_source = fallback_path
+
+    print(f"[DEBUG] Working directory: {os.getcwd()}")
+    print(f"[DEBUG] Original video_source arg: {original_source}")
+    print(f"[DEBUG] Resolved video_source path: {os.path.abspath(video_source)}")
+    print(f"[DEBUG] Video exists check: {os.path.exists(video_source)}")
+    print(f"[DEBUG] MODEL is None: {MODEL is None}")
+
+    if not os.path.exists(video_source) or MODEL is None:
+        if not os.path.exists(video_source):
+            print(f"[SYSTEM NOTICE] Fatal: Video asset not found at '{os.path.abspath(video_source)}'. Launching Simulation Mode.")
+        if MODEL is None:
+            print("[SYSTEM NOTICE] Fatal: YOLO model failed to load (see [ERROR] above). Launching Simulation Mode.")
+        run_simulation_loop()
+        return
+
     cap = cv2.VideoCapture(video_source)
-    
+    if not cap.isOpened():
+        print(f"[SYSTEM NOTICE] Fatal: cv2.VideoCapture could not open '{video_source}' (codec/format issue?). Launching Simulation Mode.")
+        run_simulation_loop()
+        return
+
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    zone_1, zone_2, divider_x = get_dynamic_zones(frame_width, frame_height)
+
+    print(f"[DEBUG] Video opened successfully: {frame_width}x{frame_height}")
+
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
-            print("[INFO] Video stream ended or failed to load.")
-            break
-            
+            # Tự động lặp lại video từ đầu khi chạy hết file để tiện Demo
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
         current_time = time.time()
         current_queue_density = 0
-        
-        # Track people (Class 0) using ByteTrack
-        results = MODEL.track(frame, persist=True, classes=[0], tracker="bytetrack.yaml")
-        
-        # Annotate ROI Zones on monitor
-        cv2.polylines(frame, [ZONE_1_QUEUE], True, (0, 255, 0), 2)  # Zone 1: Green Area
-        cv2.polylines(frame, [ZONE_2_COUNTER], True, (255, 0, 0), 2) # Zone 2: Blue Area
-        
+        results = MODEL.track(
+            frame,
+            persist=True,
+            classes=[0],
+            tracker="bytetrack.yaml",
+            conf=0.1,      # Hạ ngưỡng confidence (mặc định 0.25) để bắt cả người bị che/ở xa
+            iou=0.5,        # Ngưỡng NMS - giữ được người đứng sát nhau, tránh gộp box
+            imgsz=960       # Tăng độ phân giải inference (mặc định 640) để không mất chi tiết người nhỏ
+        )
+
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy().astype(int)
-            
+
             for box, pid in zip(boxes, ids):
-                # Neo point: Bottom center of bounding box representing foot coordinate
-                foot_point = ((box[0] + box[2]) / 2, box[3])
-                
-                in_z1 = is_inside_zone(foot_point, ZONE_1_QUEUE)
-                in_z2 = is_inside_zone(foot_point, ZONE_2_COUNTER)
-                
-                # Initialize new passenger entry inside the system registry
+                foot_point = (int((box[0] + box[2]) / 2), int(box[3]))
+                in_z1 = is_inside_zone(foot_point, zone_1)
+                in_z2 = is_inside_zone(foot_point, zone_2)
+
                 if pid not in PASSENGER_REGISTRY:
                     PASSENGER_REGISTRY[pid] = {"enter_z1": None, "exit_z1": None, "exit_z2": None}
-                
-                # Phase 1: Passenger enters the queue lane (Zone 1)
+
                 if in_z1:
                     current_queue_density += 1
                     if PASSENGER_REGISTRY[pid]["enter_z1"] is None:
                         PASSENGER_REGISTRY[pid]["enter_z1"] = current_time
                         TOTAL_PASSENGERS_ENTERED += 1
-                        
-                # Phase 2: Passenger leaves the queue (Zone 1) and approaches the desk (Zone 2)
+
                 if in_z2:
                     if PASSENGER_REGISTRY[pid]["exit_z1"] is None:
                         PASSENGER_REGISTRY[pid]["exit_z1"] = current_time
-                        # Record completed queue wait time (Simulating 1s real = 30s scaled for demonstration)
                         if PASSENGER_REGISTRY[pid]["enter_z1"] is not None:
                             actual_wait = (PASSENGER_REGISTRY[pid]["exit_z1"] - PASSENGER_REGISTRY[pid]["enter_z1"]) * 30 / 60
                             HISTORICAL_WAIT_TIMES.append(actual_wait)
-                            
-                # Phase 3: Passenger finishes check-in procedures and leaves the desk (Zone 2)
+
                 if not in_z1 and not in_z2 and PASSENGER_REGISTRY[pid]["exit_z1"] is not None and PASSENGER_REGISTRY[pid]["exit_z2"] is None:
                     PASSENGER_REGISTRY[pid]["exit_z2"] = current_time
-                    # Record completed processing desk time (Simulating 1s real = 30s scaled)
                     actual_proc = (PASSENGER_REGISTRY[pid]["exit_z2"] - PASSENGER_REGISTRY[pid]["exit_z1"]) * 30 / 60
                     HISTORICAL_PROCESSING_TIMES.append(actual_proc)
 
-        # Calculate final mathematical SLA averages
         final_avg_wait = np.mean(HISTORICAL_WAIT_TIMES) if HISTORICAL_WAIT_TIMES else 0.0
         final_avg_proc = np.mean(HISTORICAL_PROCESSING_TIMES) if HISTORICAL_PROCESSING_TIMES else 0.0
-        
-        # Calculate trend analysis and accumulation velocity
+
         trend_status, trend_cycles = analyze_processing_trend(final_avg_proc)
         accumulation_rate = calculate_accumulation_rate(current_time)
         ocr_weight = mock_ocr_weight_sensor()
-        
-        # CONTEXT-AWARE DETERMINISTIC LOGIC: Determine baggage dispute without ML training overhead
+
         detected_incident = None
         if ocr_weight > 20.0 and final_avg_proc > 4.0:
             detected_incident = "LUGGAGE_DISPUTE"
-            
-        # Hardcode an emergency situation for testing the 20-second timeout mechanism
         if final_avg_wait > 12.0:
             detected_incident = "MEDICAL_EMERGENCY"
 
-        # Construct payload message packet for Trạm 3 (LLM Engine)
         metrics_payload = {
             "current_queue_density": current_queue_density,
             "avg_wait_time_minutes": round(final_avg_wait, 1),
@@ -177,13 +275,17 @@ def run_vision_pipeline(video_source="airport_mock.mp4"):
             "trigger_incident": detected_incident,
             "system_timestamp": current_time
         }
-        
-        # Export metrics payload payload to shared JSON file
-        with open("chokepoint_metrics.json", "w") as f:
+
+        with open(OUTPUT_PATH, "w") as f:
             json.dump(metrics_payload, f, indent=4)
-            
-        # Display annotated feed
-        cv2.imshow("ChokePoint AI - Data Pipeline Engine", frame if results[0].boxes.id is None else results[0].plot())
+
+        render_frame = results[0].plot()
+        cv2.polylines(render_frame, [zone_1], True, (0, 255, 0), 2)
+        cv2.polylines(render_frame, [zone_2], True, (255, 0, 0), 2)
+
+        cv2.imwrite(FRAME_OUTPUT_PATH, render_frame)
+
+        cv2.imshow("ChokePoint AI - Core Pipeline Terminal", render_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 

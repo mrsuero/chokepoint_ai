@@ -2,154 +2,157 @@ import json
 import time
 import os
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
-API_KEY_OPENAI = os.getenv("OPENAI_API_KEY")
-API_KEY_GEMINI = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    print("[ERROR] GEMINI_API_KEY environment variable is missing. Core routing halted.")
+    exit(1)
 
-if not API_KEY_OPENAI or not API_KEY_GEMINI:
-    raise ValueError("API keys for OpenAI and Gemini must be set in the .env file.")
-
+client = genai.Client(api_key=API_KEY)
 CRITICAL_TICKET_START_TIME = None
 
-def load_metrics_data(filepath="chokepoint_metrics.json"):
+# Correct reading and writing endpoints targeting frontend runtime paths
+INPUT_METRICS_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
+OUTPUT_UI_STATE_PATH = os.path.join("..", "frontend_ui", "public", "agent_ui_state.json")
+
+def load_metrics_data():
     """
     Imports metrics payload generated dynamically by the computer vision process.
     """
-    if not os.path.exists(filepath):
+    if not os.path.exists(INPUT_METRICS_PATH):
         return {
-            "current_queue_density": 12,
-            "avg_wait_time_minutes": 4.5,
-            "avg_processing_time_minutes": 3.2,
+            "current_queue_density": 5,
+            "avg_wait_time_minutes": 2.1,
+            "avg_processing_time_minutes": 1.8,
+            "accumulation_rate_per_min": 0.1,
             "trend_analysis": {"proc_time_slope": "STABLE", "consecutive_cycles_of_increase": 0},
             "trigger_incident": None,
             "system_timestamp": time.time()
         }
-    with open(filepath, "r") as f:
+    with open(INPUT_METRICS_PATH, "r") as f:
         return json.load(f)
 
-def execute_agentic_reasoning(metrics):
+def call_gemini_agent_decision(metrics_payload):
     """
-    Evaluates pipeline analytics against business logic matrices.
-    Returns targeted structures partitioned for user permission roles.
+    Leverages Gemini 2.5 Flash with Structured Outputs to analyze airport metrics
+    """
+    system_instruction = (
+        "You are the executive Agentic Brain of ChokePoint AI, deployed at an airport terminal checkpoint. "
+        "Your duty is to evaluate mathematical metrics and trigger accurate mitigation actions. "
+        "Operational Thresholds:\n"
+        "- Severity NOMINAL: Default state when wait times and density are low.\n"
+        "- Severity MINIMAL (AUTO Mode): Triggered if wait time is between 5 and 12 minutes.\n"
+        "- Severity WARNING (MANUAL Mode): Triggered if a LUGGAGE_DISPUTE is flagged OR if processing time is rising non-stop.\n"
+        "- Severity CRITICAL (MANUAL_PENDING Mode): Triggered if a MEDICAL_EMERGENCY is active or wait time equals/exceeds 12 minutes."
+    )
+
+    user_content = f"Current Terminal Telemetry Data Context:\n{json.dumps(metrics_payload, indent=2)}"
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "dispatch_mode": types.Schema(type=types.Type.STRING, enum=["AUTO", "MANUAL", "MANUAL_PENDING"]),
+                        "severity": types.Schema(type=types.Type.STRING, enum=["NOMINAL", "MINIMAL", "WARNING", "CRITICAL"]),
+                        "ai_thought": types.Schema(type=types.Type.STRING),
+                        "operator_instruction": types.Schema(type=types.Type.STRING),
+                        "admin_pop_up_title": types.Schema(type=types.Type.STRING),
+                        "admin_description": types.Schema(type=types.Type.STRING),
+                        "admin_proposed_action": types.Schema(type=types.Type.STRING),
+                        "admin_log_summary": types.Schema(type=types.Type.STRING),
+                    },
+                    required=["dispatch_mode", "severity", "ai_thought"],
+                ),
+            ),
+        )
+        return json.loads(response.text)
+    except Exception as error:
+        print(f"[LLM INFERENCE ERROR] Failed to parse agent decision: {error}")
+        return None
+
+def process_and_sync_state():
+    """
+    Main orchestration loop. Handles state alignment and local time-out checks.
     """
     global CRITICAL_TICKET_START_TIME
     current_time = time.time()
-    
-    ui_state = {
-        "dispatch_mode": "AUTO",
-        "severity": "NOMINAL",
-        "ai_thought": "",
-        "operator_view": {},
-        "admin_view": {},
+
+    metrics = load_metrics_data()
+    llm_decision = call_gemini_agent_decision(metrics)
+    if not llm_decision:
+        return
+
+    final_state = {
+        "dispatch_mode": llm_decision["dispatch_mode"],
+        "severity": llm_decision["severity"],
+        "ai_thought": llm_decision["ai_thought"],
+        "operator_view": {"banner": "", "instruction": llm_decision.get("operator_instruction", "")},
+        "admin_view": {"log_summary": llm_decision.get("admin_log_summary", "")},
         "timestamp": current_time
     }
-    
-    dt_wait = metrics["avg_wait_time_minutes"]
-    dt_proc = metrics["avg_processing_time_minutes"]
-    trend = metrics["trend_analysis"]["proc_time_slope"]
-    incident = metrics["trigger_incident"]
-    
-    # Critical state path with 20 second safety deadline override execution
-    if incident == "MEDICAL_EMERGENCY" or dt_wait >= 12.0:
-        ui_state["severity"] = "CRITICAL"
-        
+
+    if llm_decision["dispatch_mode"] == "MANUAL_PENDING" or llm_decision["severity"] == "CRITICAL":
         if CRITICAL_TICKET_START_TIME is None:
             CRITICAL_TICKET_START_TIME = current_time
-            
+
         elapsed_seconds = current_time - CRITICAL_TICKET_START_TIME
-        
+        remaining_time = max(0, int(20.0 - elapsed_seconds))
+
         if elapsed_seconds > 20.0:
-            ui_state["dispatch_mode"] = "AUTO_EMERGENCY_BYPASS"
-            ui_state["ai_thought"] = "Administrative response deadline exceeded. Overriding manual confirmation block to guarantee terminal safety."
-            
-            ui_state["operator_view"] = {
-                "banner": "CRITICAL EMERGENCY OVERRIDE ORDER ACTIVATED",
-                "instruction": "AI system has routed medical first responders to current camera vector due to authorization timeout."
+            final_state["dispatch_mode"] = "AUTO_EMERGENCY_BYPASS"
+            final_state["ai_thought"] = "Administrative window exceeded 20s. Enforcing dynamic autonomous bypass."
+            final_state["operator_view"] = {
+                "banner": "CRITICAL EMERGENCY OVERRIDE ACTIVATED",
+                "instruction": "AI Agent has autonomously deployed Station A Medical Responders due to command latency."
             }
-            ui_state["admin_view"] = {
-                "alert": "SECURITY SYSTEM AUTONOMOUS DISPATCH OVERRIDE",
-                "details": "Twenty second window expired without user feedback. Emergency deployment enforced."
+            final_state["admin_view"] = {
+                "alert": "SECURITY DEPLOYMENT FORCE BYPASS",
+                "details": "SLA window expired without user validation. Autonomous emergency response executed."
             }
         else:
-            ui_state["dispatch_mode"] = "MANUAL_PENDING"
-            remaining_time = max(0, int(20.0 - elapsed_seconds))
-            ui_state["ai_thought"] = f"Severe event registered. Pending admin verification. Escalation lock remains active for {remaining_time}s."
-            
-            ui_state["operator_view"] = {
-                "banner": "PENDING COMMAND TOWER AUTHORIZATION",
-                "instruction": "Emergency event detected. Operations parameters escalated to executive terminal. Wait for orders."
+            final_state["operator_view"] = {
+                "banner": "AWAITING EXECUTIVE VALIDATION",
+                "instruction": "Emergency alert routed to command terminal. Prepare station zone for responder arrival."
             }
-            ui_state["admin_view"] = {
-                "pop_up_title": "CRITICAL RISK LEVEL DETECTED",
-                "description": f"Terminal physical trauma anomaly or severe SLA deterioration observed. Wait time at {dt_wait} mins.",
-                "proposed_action": "Authorise immediate deployment of Station A First Aid Unit to current coordinates.",
+            final_state["admin_view"] = {
+                "pop_up_title": llm_decision.get("admin_pop_up_title", "CRITICAL INCIDENT ALERT"),
+                "description": llm_decision.get("admin_description", ""),
+                "proposed_action": llm_decision.get("admin_proposed_action", ""),
                 "countdown_seconds": remaining_time,
                 "action_buttons_enabled": True
             }
-        return ui_state
-
-    CRITICAL_TICKET_START_TIME = None
-
-    # Medium severity path tracking chronic processing infrastructure degradation
-    if incident == "LUGGAGE_DISPUTE" or (dt_proc > 4.0 and trend == "INCREASING_NON_STOP"):
-        ui_state["dispatch_mode"] = "MANUAL"
-        ui_state["severity"] = "WARNING"
-        ui_state["ai_thought"] = "Desk latency increasing sequentially over last 3 updates. Compounding bottleneck verified."
-        
-        ui_state["operator_view"] = {
-            "banner": "COUNTER SERVICE LATENCY ALERT",
-            "instruction": "Processing speeds dropping below nominal baseline. Escalation package routed to line supervisor."
-        }
-        ui_state["admin_view"] = {
-            "pop_up_title": "OPERATIONAL BOTTLENECK ESCALATION",
-            "description": f"Desk performance average at {dt_proc} mins with sustained upward delta.",
-            "proposed_action": "Freeze check-in assignment cycles for Counter 3, shift arrivals to Counter 6, and deploy Floor Supervisor.",
-            "action_buttons_enabled": True
-        }
-        return ui_state
-
-    # Low severity operations path using standard automated configuration changes
-    ui_state["dispatch_mode"] = "AUTO"
-    
-    if 5.0 <= dt_wait < 12.0 or metrics["current_queue_density"] > 10:
-        ui_state["severity"] = "MINIMAL"
-        ui_state["ai_thought"] = "Mass density metric expansion observed. Triggering local layout routing updates."
-        action_payload = "AUTOMATED COMMAND: Updated dynamic terminal LED boards to open Line 4. Distributed local optimization advice to counter client interfaces."
-        
-        ui_state["operator_view"] = {
-            "banner": "AUTOMATED ADJUSTMENT DISPATCHED",
-            "instruction": action_payload
-        }
-        ui_state["admin_view"] = {
-            "log_summary": f"System deployed minor layout changes. Average wait parameters stable at {dt_wait} mins."
-        }
     else:
-        ui_state["severity"] = "NOMINAL"
-        ui_state["ai_thought"] = "All checked parameters matching standard operational profiles."
-        ui_state["operator_view"] = {"instruction": "System fully operational. Standard load balances verified."}
-        ui_state["admin_view"] = {"log_summary": "Continuous background monitoring active. Balance confirmed."}
+        CRITICAL_TICKET_START_TIME = None
+        if llm_decision["dispatch_mode"] == "MANUAL":
+            final_state["operator_view"]["banner"] = "COUNTER EFFICIENCY DEGRADATION WARNING"
+            final_state["admin_view"] = {
+                "pop_up_title": llm_decision.get("admin_pop_up_title", "OPERATION DEGRADATION ESCALATION"),
+                "description": llm_decision.get("admin_description", ""),
+                "proposed_action": llm_decision.get("admin_proposed_action", ""),
+                "action_buttons_enabled": True
+            }
+        elif llm_decision["dispatch_mode"] == "AUTO" and llm_decision["severity"] == "MINIMAL":
+            final_state["operator_view"]["banner"] = "AUTOMATED ROUTING UPDATE ACTIVE"
 
-    return ui_state
-
-def sync_ui_state(ui_state_data):
-    """
-    Writes computed state payload to shared disk repository for frontend presentation layers.
-    """
-    with open("agent_ui_state.json", "w", encoding="utf-8") as f:
-        json.dump(ui_state_data, f, ensure_ascii=False, indent=4)
+    os.makedirs(os.path.dirname(OUTPUT_UI_STATE_PATH), exist_ok=True)
+    with open(OUTPUT_UI_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(final_state, f, ensure_ascii=False, indent=4)
 
 def start_agent_daemon():
-    """
-    Main background execution routine checking parameters at fixed 1-second ticks.
-    """
-    print("[INIT] ChokePoint AI Agent Engine processing loops active.")
+    print("[INIT] ChokePoint AI Agent Engine processing loops successfully bound to Gemini API.")
     while True:
-        metrics = load_metrics_data()
-        state = execute_agentic_reasoning(metrics)
-        sync_ui_state(state)
-        time.sleep(1)
+        process_and_sync_state()
+        time.sleep(20)
 
 if __name__ == "__main__":
     start_agent_daemon()
