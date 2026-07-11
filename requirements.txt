@@ -1,0 +1,25 @@
+# ==============================================================================
+# CHOKEPOINT AI - GLOBAL PROJECT ENVIRONMENT REQUIREMENTS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# SECTION 1: AI BACKEND PYTHON DEPENDENCIES (Install via: pip install -r requirements.txt)
+# ------------------------------------------------------------------------------
+ultralytics>=8.3.0,<9.0.0
+opencv-python>=4.9.0.80,<5.0.0
+numpy>=1.24.0,<2.0.0
+google-genai>=0.1.0,<2.0.0
+python-dotenv>=1.0.1,<2.0.0
+
+# ------------------------------------------------------------------------------
+# SECTION 2: FRONTEND NODE.JS DEPENDENCIES (Reference ONLY - Managed via npm)
+# ------------------------------------------------------------------------------
+# [Core Libraries]
+# react: ^19.0.0
+# react-dom: ^19.0.0
+#
+# [Build Tools & Dev Dependencies]
+# vite: 6.0.0
+# @vitejs/plugin-react: ^5.0.0
+# @types/react: ^19.0.0
+# @types/react-dom: ^19.0.0

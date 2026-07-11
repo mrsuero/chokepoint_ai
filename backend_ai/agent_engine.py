@@ -1,6 +1,8 @@
 import json
-import time
 import os
+import sys
+import time
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -10,14 +12,22 @@ load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     print("[ERROR] GEMINI_API_KEY environment variable is missing. Core routing halted.")
-    exit(1)
+    sys.exit(1)
 
 client = genai.Client(api_key=API_KEY)
 CRITICAL_TICKET_START_TIME = None
 
-# Correct reading and writing endpoints targeting frontend runtime paths
-INPUT_METRICS_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
-OUTPUT_UI_STATE_PATH = os.path.join("..", "frontend_ui", "public", "agent_ui_state.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+
+
+def resolve_frontend_public_path(filename):
+    return os.path.join(PROJECT_ROOT, "frontend_ui", "public", filename)
+
+
+INPUT_METRICS_PATH = resolve_frontend_public_path("chokepoint_metrics.json")
+OUTPUT_UI_STATE_PATH = resolve_frontend_public_path("agent_ui_state.json")
+
 
 def load_metrics_data():
     """
@@ -31,14 +41,16 @@ def load_metrics_data():
             "accumulation_rate_per_min": 0.1,
             "trend_analysis": {"proc_time_slope": "STABLE", "consecutive_cycles_of_increase": 0},
             "trigger_incident": None,
-            "system_timestamp": time.time()
+            "system_timestamp": time.time(),
         }
-    with open(INPUT_METRICS_PATH, "r") as f:
-        return json.load(f)
+
+    with open(INPUT_METRICS_PATH, "r", encoding="utf-8") as file_handle:
+        return json.load(file_handle)
+
 
 def call_gemini_agent_decision(metrics_payload):
     """
-    Leverages Gemini 2.5 Flash with Structured Outputs to analyze airport metrics
+    Leverages Gemini 2.5 Flash with Structured Outputs to analyze airport metrics.
     """
     system_instruction = (
         "You are the executive Agentic Brain of ChokePoint AI, deployed at an airport terminal checkpoint. "
@@ -54,7 +66,7 @@ def call_gemini_agent_decision(metrics_payload):
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model="gemini-2.5-flash",
             contents=user_content,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -80,6 +92,7 @@ def call_gemini_agent_decision(metrics_payload):
         print(f"[LLM INFERENCE ERROR] Failed to parse agent decision: {error}")
         return None
 
+
 def process_and_sync_state():
     """
     Main orchestration loop. Handles state alignment and local time-out checks.
@@ -98,7 +111,7 @@ def process_and_sync_state():
         "ai_thought": llm_decision["ai_thought"],
         "operator_view": {"banner": "", "instruction": llm_decision.get("operator_instruction", "")},
         "admin_view": {"log_summary": llm_decision.get("admin_log_summary", "")},
-        "timestamp": current_time
+        "timestamp": current_time,
     }
 
     if llm_decision["dispatch_mode"] == "MANUAL_PENDING" or llm_decision["severity"] == "CRITICAL":
@@ -113,23 +126,23 @@ def process_and_sync_state():
             final_state["ai_thought"] = "Administrative window exceeded 20s. Enforcing dynamic autonomous bypass."
             final_state["operator_view"] = {
                 "banner": "CRITICAL EMERGENCY OVERRIDE ACTIVATED",
-                "instruction": "AI Agent has autonomously deployed Station A Medical Responders due to command latency."
+                "instruction": "AI Agent has autonomously deployed Station A Medical Responders due to command latency.",
             }
             final_state["admin_view"] = {
                 "alert": "SECURITY DEPLOYMENT FORCE BYPASS",
-                "details": "SLA window expired without user validation. Autonomous emergency response executed."
+                "details": "SLA window expired without user validation. Autonomous emergency response executed.",
             }
         else:
             final_state["operator_view"] = {
                 "banner": "AWAITING EXECUTIVE VALIDATION",
-                "instruction": "Emergency alert routed to command terminal. Prepare station zone for responder arrival."
+                "instruction": "Emergency alert routed to command terminal. Prepare station zone for responder arrival.",
             }
             final_state["admin_view"] = {
                 "pop_up_title": llm_decision.get("admin_pop_up_title", "CRITICAL INCIDENT ALERT"),
                 "description": llm_decision.get("admin_description", ""),
                 "proposed_action": llm_decision.get("admin_proposed_action", ""),
                 "countdown_seconds": remaining_time,
-                "action_buttons_enabled": True
+                "action_buttons_enabled": True,
             }
     else:
         CRITICAL_TICKET_START_TIME = None
@@ -139,20 +152,22 @@ def process_and_sync_state():
                 "pop_up_title": llm_decision.get("admin_pop_up_title", "OPERATION DEGRADATION ESCALATION"),
                 "description": llm_decision.get("admin_description", ""),
                 "proposed_action": llm_decision.get("admin_proposed_action", ""),
-                "action_buttons_enabled": True
+                "action_buttons_enabled": True,
             }
         elif llm_decision["dispatch_mode"] == "AUTO" and llm_decision["severity"] == "MINIMAL":
             final_state["operator_view"]["banner"] = "AUTOMATED ROUTING UPDATE ACTIVE"
 
     os.makedirs(os.path.dirname(OUTPUT_UI_STATE_PATH), exist_ok=True)
-    with open(OUTPUT_UI_STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(final_state, f, ensure_ascii=False, indent=4)
+    with open(OUTPUT_UI_STATE_PATH, "w", encoding="utf-8") as file_handle:
+        json.dump(final_state, file_handle, ensure_ascii=False, indent=4)
+
 
 def start_agent_daemon():
     print("[INIT] ChokePoint AI Agent Engine processing loops successfully bound to Gemini API.")
     while True:
         process_and_sync_state()
         time.sleep(20)
+
 
 if __name__ == "__main__":
     start_agent_daemon()
