@@ -35,6 +35,7 @@ if Langfuse and LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY:
         )
     except Exception as error:
         print(f"[WARN] Langfuse init skipped: {error}")
+
 CRITICAL_TICKET_START_TIME = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,23 +50,39 @@ INPUT_METRICS_PATH = resolve_frontend_public_path("chokepoint_metrics.json")
 OUTPUT_UI_STATE_PATH = resolve_frontend_public_path("agent_ui_state.json")
 
 
+DEFAULT_METRICS = {
+    "current_queue_density": 5,
+    "avg_wait_time_minutes": 2.1,
+    "avg_processing_time_minutes": 1.8,
+    "accumulation_rate_per_min": 0.1,
+    "trend_analysis": {"proc_time_slope": "STABLE", "consecutive_cycles_of_increase": 0},
+    "trigger_incident": None,
+    "system_timestamp": time.time(),
+}
+
+
 def load_metrics_data():
     """
     Imports metrics payload generated dynamically by the computer vision process.
+    Falls back to defaults if the file is missing, empty, or mid-write (e.g. the
+    CV process is in the middle of writing it when we try to read it).
     """
     if not os.path.exists(INPUT_METRICS_PATH):
-        return {
-            "current_queue_density": 5,
-            "avg_wait_time_minutes": 2.1,
-            "avg_processing_time_minutes": 1.8,
-            "accumulation_rate_per_min": 0.1,
-            "trend_analysis": {"proc_time_slope": "STABLE", "consecutive_cycles_of_increase": 0},
-            "trigger_incident": None,
-            "system_timestamp": time.time(),
-        }
+        return DEFAULT_METRICS
 
-    with open(INPUT_METRICS_PATH, "r", encoding="utf-8") as file_handle:
-        return json.load(file_handle)
+    try:
+        with open(INPUT_METRICS_PATH, "r", encoding="utf-8") as file_handle:
+            content = file_handle.read()
+            if not content.strip():
+                print("[WARN] Metrics file is empty (likely mid-write). Using defaults for this cycle.")
+                return DEFAULT_METRICS
+            return json.loads(content)
+    except json.JSONDecodeError as error:
+        print(f"[WARN] Metrics file contains invalid JSON ({error}). Using defaults for this cycle.")
+        return DEFAULT_METRICS
+    except OSError as error:
+        print(f"[WARN] Could not read metrics file ({error}). Using defaults for this cycle.")
+        return DEFAULT_METRICS
 
 
 def call_gemini_agent_decision(metrics_payload):

@@ -25,7 +25,7 @@ SYSTEM_START_TIME = time.time()
 
 # Target data paths directly inside the Frontend public repository
 OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
-FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame.jpg")
+FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame1.jpg")
 
 # === TOẠ ĐỘ ZONE (đã calibrate thực tế bằng get_coords.py) ===
 ZONE_1_SOURCE = np.array([

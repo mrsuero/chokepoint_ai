@@ -3,6 +3,7 @@ import numpy as np
 import time
 import json
 import os
+from collections import deque
 from ultralytics import YOLO
 
 # Global model initialization
@@ -14,9 +15,8 @@ except Exception as e:
     MODEL = None
 
 # Runtime tracking data structures
-PASSENGER_REGISTRY = {}
-HISTORICAL_WAIT_TIMES = []
-HISTORICAL_PROCESSING_TIMES = []
+PASSENGER_REGISTRY = {}          # pid -> {"first_seen", "last_seen"} - không còn phụ thuộc zone
+HISTORICAL_DWELL_TIMES = []      # thời gian hiện diện (phút) của từng người đã rời khỏi khung hình
 PROC_TIME_TREND_BUFFER = []
 
 # Statistical initial states
@@ -25,22 +25,7 @@ SYSTEM_START_TIME = time.time()
 
 # Target data paths directly inside the Frontend public repository
 OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
-FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame2.jpg")
-
-# === TOẠ ĐỘ ZONE (đã calibrate thực tế bằng get_coords.py) ===
-ZONE_1_SOURCE = np.array([
-    [296, 429],  # Top-Left (1)
-    [632, 88],  # Top-Right (2)
-    [765, 94],  # Bottom-Right (3)
-    [757, 427]   # Bottom-Left (4)
-], np.int32)  # Zone 1 - khu vực xếp hàng chờ để vô làm thủ tục
-
-ZONE_2_SOURCE = np.array([
-    [520, 80],  # Top-Left (1)
-    [615, 85],  # Top-Right (2)
-    [235, 431],  # Bottom-Right (3)
-    [70, 417]   # Bottom-Left (4)
-], np.int32)  # Zone 2 - khu vực làm thủ tục tại quầy
+FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame3.jpg")
 
 LUGGAGE_LABELS = {"backpack", "handbag", "suitcase"}
 LUGGAGE_STATIONARY_THRESHOLD_MINUTES = 10
@@ -48,60 +33,59 @@ LUGGAGE_MOVEMENT_TOLERANCE_PX = 15
 
 LUGGAGE_TRACKER = {}
 
-def get_dynamic_zones(frame_width, frame_height):
+# === PHÁT HIỆN ẨU ĐẢ / ĐÁNH NHAU (thay cho logic chia zone cũ) ===
+# Không dùng pose model riêng, chỉ dùng bounding box người từ YOLO tracker có sẵn.
+# LƯU Ý QUAN TRỌNG: khi 1 người tung cú đấm, THÂN NGƯỜI hầu như đứng yên - chỉ
+# có tay vươn ra - nên nếu chỉ đo vận tốc TÂM bbox thì gần như không phát hiện
+# được cú đấm (đây là lý do bản trước đó bị bỏ sót cảnh đấm bốc). Thay vào đó:
+#   1) Đo khoảng cách CẠNH-VỚI-CẠNH giữa 2 bbox (không phải tâm-với-tâm) để
+#      biết 2 người có đang trong tầm với/đá của nhau hay không - chính xác
+#      hơn nhiều so với khoảng cách tâm khi 2 người đứng đối mặt tầm sải tay.
+#   2) Đo mức "phình/co" của bbox (width, height) qua từng frame. Khi tay/chân
+#      vươn ra đấm/đá, bbox người sẽ phình rộng đột ngột dù tâm không đổi -
+#      đây là tín hiệu tốt hơn nhiều để bắt cử động chi so với tâm bbox.
+#   3) Kết hợp cả 2 tín hiệu trên, xác nhận qua nhiều frame liên tiếp để giảm
+#      báo nhầm khi chỉ là nhiễu detection thoáng qua.
+ALTERCATION_EDGE_GAP_PX = 40           # 2 bbox được coi là "trong tầm với nhau" nếu khoảng cách cạnh-với-cạnh dưới ngưỡng này
+ALTERCATION_MOTION_PX = 14             # biến động (tâm di chuyển HOẶC kích thước bbox thay đổi) mỗi frame để coi là "cử động mạnh"
+ALTERCATION_FRAME_WINDOW = 20          # số frame gần nhất dùng để xác nhận, giảm false positive tức thời
+ALTERCATION_CONFIRM_RATIO = 0.4        # tỉ lệ frame "nghi vấn" trong window để xác nhận là ẩu đả thật
+
+PERSON_MOTION_TRACKER = {}             # pid -> {"prev_center", "prev_size": (w, h), "motion_history": deque}
+ALTERCATION_FRAME_BUFFER = deque(maxlen=ALTERCATION_FRAME_WINDOW)
+
+
+def box_edge_gap(box_a, box_b):
     """
-    Cả 2 zone đều lấy trực tiếp từ toạ độ đã calibrate bằng get_coords.py.
+    Khoảng cách cạnh-với-cạnh giữa 2 bounding box (x1, y1, x2, y2).
+    Trả về 0 nếu 2 box chồng lấn nhau (đang chạm/gần như chạm).
     """
-    zone_1 = ZONE_1_SOURCE
-    zone_2 = ZONE_2_SOURCE
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
 
-    # Đường ranh giới ảo minh hoạ (lấy trung bình toạ độ x của zone_2 làm mốc)
-    divider_x = int(np.mean(zone_2[:, 0]))
+    gap_x = max(0.0, max(ax1, bx1) - min(ax2, bx2))
+    gap_y = max(0.0, max(ay1, by1) - min(ay2, by2))
 
-    return zone_1, zone_2, divider_x
+    return (gap_x ** 2 + gap_y ** 2) ** 0.5
 
-def is_inside_zone(point, polygon_zone):
-    """
-    Evaluates point polygon inclusion test to check if coordinate matches target ROI.
-    """
-    return cv2.pointPolygonTest(polygon_zone, point, False) >= 0
-
-
-def draw_zone_labels(frame, zone_1, zone_2, zone_1_count, zone_2_count):
-    zone_1_min = zone_1.min(axis=0)
-    zone_2_min = zone_2.min(axis=0)
-
-    cv2.putText(frame, "ZONE 1: WAITING AREA", (int(zone_1_min[0]), max(25, int(zone_1_min[1]) - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-    cv2.putText(frame, f"PAX: {zone_1_count}", (int(zone_1_min[0]), max(50, int(zone_1_min[1]) + 15)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-
-    cv2.putText(frame, "ZONE 2: CHECK-IN AREA", (int(zone_2_min[0]), max(25, int(zone_2_min[1]) - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
-    cv2.putText(frame, f"PAX: {zone_2_count}", (int(zone_2_min[0]), max(50, int(zone_2_min[1]) + 15)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
-
-    cv2.rectangle(frame, (20, 20), (360, 78), (15, 23, 42), -1)
-    cv2.rectangle(frame, (20, 20), (360, 78), (71, 85, 105), 1)
-    cv2.putText(frame, "ZONE TRACKING LEGEND", (32, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (226, 232, 240), 2)
-    cv2.putText(frame, "GREEN = WAITING AREA | BLUE = CHECK-IN AREA", (32, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (148, 163, 184), 1)
 
 def calculate_accumulation_rate(current_time):
     """
     Calculates the linear passenger inflow accumulation delta per minute.
     """
     elapsed_minutes = (current_time - SYSTEM_START_TIME) / 60
-    total_exited_z1 = len(HISTORICAL_WAIT_TIMES)
+    total_exited = len(HISTORICAL_DWELL_TIMES)
     if elapsed_minutes > 0:
-        return (TOTAL_PASSENGERS_ENTERED - total_exited_z1) / elapsed_minutes
+        return (TOTAL_PASSENGERS_ENTERED - total_exited) / elapsed_minutes
     return 0.0
 
-def analyze_processing_trend(current_avg_proc):
+
+def analyze_processing_trend(current_avg_dwell):
     """
     Tracks historical data derivatives over 3 data steps to verify monotonic expansion.
     """
     global PROC_TIME_TREND_BUFFER
-    PROC_TIME_TREND_BUFFER.append(current_avg_proc)
+    PROC_TIME_TREND_BUFFER.append(current_avg_dwell)
     if len(PROC_TIME_TREND_BUFFER) > 3:
         PROC_TIME_TREND_BUFFER.pop(0)
     if len(PROC_TIME_TREND_BUFFER) < 3:
@@ -109,6 +93,78 @@ def analyze_processing_trend(current_avg_proc):
     if PROC_TIME_TREND_BUFFER[0] < PROC_TIME_TREND_BUFFER[1] < PROC_TIME_TREND_BUFFER[2]:
         return "INCREASING_NON_STOP", 3
     return "STABLE", 0
+
+
+def update_person_motion(pid, center, box):
+    """
+    Cập nhật lịch sử chuyển động của 1 người, trả về điểm "motion_score" trung
+    bình gần đây (px/frame). motion_score lấy giá trị LỚN HƠN giữa:
+      - vận tốc tâm bbox (bắt cử động toàn thân: bước tới, né, ngã...)
+      - biến động kích thước bbox (bắt cử động chi: vươn tay đấm, đá...)
+    vì một cú đấm thường không di chuyển tâm thân nhiều nhưng làm bbox phình
+    rộng đột ngột khi tay vươn ra khỏi khung thân.
+    """
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+
+    state = PERSON_MOTION_TRACKER.get(pid)
+    if state is None:
+        state = {
+            "prev_center": center,
+            "prev_size": (width, height),
+            "motion_history": deque(maxlen=5),
+        }
+        PERSON_MOTION_TRACKER[pid] = state
+        return 0.0
+
+    prev_center = state["prev_center"]
+    prev_width, prev_height = state["prev_size"]
+
+    center_velocity = ((center[0] - prev_center[0]) ** 2 + (center[1] - prev_center[1]) ** 2) ** 0.5
+    size_change = abs(width - prev_width) + abs(height - prev_height)
+    motion_score = max(center_velocity, size_change)
+
+    state["motion_history"].append(motion_score)
+    state["prev_center"] = center
+    state["prev_size"] = (width, height)
+
+    return sum(state["motion_history"]) / len(state["motion_history"])
+
+
+def detect_altercation_candidate(persons_this_frame):
+    """
+    persons_this_frame: list of (pid, center, box) cho tất cả người phát hiện được trong frame hiện tại.
+    Trả về True nếu có ít nhất 1 cặp người vừa trong tầm với nhau (khoảng cách
+    cạnh-với-cạnh, không phải tâm-với-tâm) VỪA có cử động mạnh/đột ngột đồng
+    thời (thân hoặc chi) - dấu hiệu nghi vấn xô xát/đấm nhau.
+    """
+    motion_scores = {pid: update_person_motion(pid, center, box) for pid, center, box in persons_this_frame}
+
+    for i in range(len(persons_this_frame)):
+        pid_a, _, box_a = persons_this_frame[i]
+        for j in range(i + 1, len(persons_this_frame)):
+            pid_b, _, box_b = persons_this_frame[j]
+
+            if box_edge_gap(box_a, box_b) > ALTERCATION_EDGE_GAP_PX:
+                continue
+
+            if motion_scores[pid_a] >= ALTERCATION_MOTION_PX and motion_scores[pid_b] >= ALTERCATION_MOTION_PX:
+                return True
+
+    return False
+
+
+def draw_altercation_overlay(frame, person_count, altercation_confirmed):
+    cv2.rectangle(frame, (20, 20), (380, 78), (15, 23, 42), -1)
+    cv2.rectangle(frame, (20, 20), (380, 78), (71, 85, 105), 1)
+    cv2.putText(frame, "CHOKEPOINT AI - LIVE ANALYTICS", (32, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (226, 232, 240), 2)
+    cv2.putText(frame, f"PAX IN FRAME: {person_count}", (32, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (148, 163, 184), 1)
+
+    if altercation_confirmed:
+        cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), (0, 0, 255), 6)
+        cv2.putText(frame, "!!! SUSPECTED PHYSICAL ALTERCATION !!!", (32, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
 
 def run_simulation_loop():
     """
@@ -126,8 +182,7 @@ def run_simulation_loop():
         elapsed = current_time - SYSTEM_START_TIME
 
         current_queue_density = 8 + int(np.sin(elapsed / 10) * 4)
-        simulated_wait = 4.5 + (elapsed * 0.05)
-        simulated_proc = 2.5 + (elapsed * 0.02)
+        simulated_dwell = 4.5 + (elapsed * 0.05)
 
         trend_status = "STABLE"
         trend_cycles = 0
@@ -136,15 +191,15 @@ def run_simulation_loop():
             trend_cycles = 3
 
         detected_incident = None
-        if simulated_wait >= 12.0:
+        if elapsed > 20 and elapsed <= 35:
+            detected_incident = "SUSPECTED_PHYSICAL_ALTERCATION"
+        elif simulated_dwell >= 12.0:
             detected_incident = "MEDICAL_EMERGENCY"
-        elif elapsed > 20 and elapsed <= 35:
-            detected_incident = "SUSPECTED_LUGGAGE_DISPUTE"
 
         metrics_payload = {
             "current_queue_density": max(0, current_queue_density),
-            "avg_wait_time_minutes": round(simulated_wait, 1),
-            "avg_processing_time_minutes": round(simulated_proc, 1),
+            "avg_wait_time_minutes": round(simulated_dwell, 1),
+            "avg_processing_time_minutes": round(simulated_dwell * 0.6, 1),
             "accumulation_rate_per_min": round(0.5 + (current_queue_density * 0.1), 2),
             "trend_analysis": {
                 "proc_time_slope": trend_status,
@@ -170,7 +225,8 @@ def run_simulation_loop():
         cv2.imwrite(FRAME_OUTPUT_PATH, frame_copy)
         time.sleep(1)
 
-def run_vision_pipeline(video_source="video2.mp4"):
+
+def run_vision_pipeline(video_source="video3.mp4"):
     global TOTAL_PASSENGERS_ENTERED
 
     # Cơ chế tự động quét thông minh: Check thư mục hiện tại trước, nếu không thấy thì check thư mục cha
@@ -204,8 +260,6 @@ def run_vision_pipeline(video_source="video2.mp4"):
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    zone_1, zone_2, divider_x = get_dynamic_zones(frame_width, frame_height)
-
     print(f"[DEBUG] Video opened successfully: {frame_width}x{frame_height}")
 
     while cap.isOpened():
@@ -216,10 +270,9 @@ def run_vision_pipeline(video_source="video2.mp4"):
             continue
 
         current_time = time.time()
-        current_queue_density = 0
-        zone_1_people_count = 0
-        zone_2_people_count = 0
+        persons_this_frame = []      # list (pid, center, box) - toàn bộ khung hình, không chia zone
         zone_1_luggage_count = 0
+
         results = MODEL.track(
             frame,
             persist=True,
@@ -237,10 +290,7 @@ def run_vision_pipeline(video_source="video2.mp4"):
 
             for box, pid, class_id in zip(boxes, ids, class_ids):
                 center_point = (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
-                foot_point = (int((box[0] + box[2]) / 2), int(box[3]))
                 label_name = results[0].names.get(int(class_id), str(class_id))
-                in_z1 = is_inside_zone(foot_point, zone_1)
-                in_z2 = is_inside_zone(foot_point, zone_2)
 
                 if label_name in LUGGAGE_LABELS:
                     tracker_state = LUGGAGE_TRACKER.get(pid)
@@ -249,7 +299,6 @@ def run_vision_pipeline(video_source="video2.mp4"):
                             "first_seen": current_time,
                             "stationary_since": current_time,
                             "last_center": center_point,
-                            "in_zone_1": in_z1,
                         }
                     else:
                         last_center = tracker_state["last_center"]
@@ -259,67 +308,68 @@ def run_vision_pipeline(video_source="video2.mp4"):
                                 tracker_state["stationary_since"] = current_time
                         else:
                             tracker_state["stationary_since"] = current_time
-
                         tracker_state["last_center"] = center_point
-                        tracker_state["in_zone_1"] = in_z1
 
                     LUGGAGE_TRACKER[pid] = tracker_state
 
                     stationary_duration = current_time - tracker_state["stationary_since"] if tracker_state["stationary_since"] else 0
-                    if in_z1 and stationary_duration >= LUGGAGE_STATIONARY_THRESHOLD_MINUTES * 60:
+                    if stationary_duration >= LUGGAGE_STATIONARY_THRESHOLD_MINUTES * 60:
                         zone_1_luggage_count += 1
 
                 if label_name != "person":
                     continue
 
+                persons_this_frame.append((pid, center_point, tuple(box)))
+
                 if pid not in PASSENGER_REGISTRY:
-                    PASSENGER_REGISTRY[pid] = {"enter_z1": None, "exit_z1": None, "exit_z2": None}
+                    PASSENGER_REGISTRY[pid] = {"first_seen": current_time, "last_seen": current_time}
+                    TOTAL_PASSENGERS_ENTERED += 1
+                else:
+                    PASSENGER_REGISTRY[pid]["last_seen"] = current_time
 
-                if in_z1:
-                    current_queue_density += 1
-                    zone_1_people_count += 1
-                    if PASSENGER_REGISTRY[pid]["enter_z1"] is None:
-                        PASSENGER_REGISTRY[pid]["enter_z1"] = current_time
-                        TOTAL_PASSENGERS_ENTERED += 1
+        # Người không còn xuất hiện gần đây -> coi như đã rời khung hình, chốt thời gian hiện diện của họ
+        STALE_TIMEOUT_SECONDS = 3.0
+        active_ids_this_frame = {pid for pid, _, _ in persons_this_frame}
+        for pid in list(PASSENGER_REGISTRY.keys()):
+            record = PASSENGER_REGISTRY[pid]
+            if pid not in active_ids_this_frame and (current_time - record["last_seen"]) > STALE_TIMEOUT_SECONDS:
+                dwell_minutes = (record["last_seen"] - record["first_seen"]) / 60
+                HISTORICAL_DWELL_TIMES.append(dwell_minutes)
+                del PASSENGER_REGISTRY[pid]
+                PERSON_MOTION_TRACKER.pop(pid, None)
 
-                if in_z2:
-                    zone_2_people_count += 1
-                    if PASSENGER_REGISTRY[pid]["exit_z1"] is None:
-                        PASSENGER_REGISTRY[pid]["exit_z1"] = current_time
-                        if PASSENGER_REGISTRY[pid]["enter_z1"] is not None:
-                            actual_wait = (PASSENGER_REGISTRY[pid]["exit_z1"] - PASSENGER_REGISTRY[pid]["enter_z1"]) * 30 / 60
-                            HISTORICAL_WAIT_TIMES.append(actual_wait)
+        # --- Phát hiện ẩu đả / đấm nhau (thay cho logic chia zone) ---
+        altercation_candidate = detect_altercation_candidate(persons_this_frame)
+        ALTERCATION_FRAME_BUFFER.append(altercation_candidate)
+        altercation_confirmed = (
+            len(ALTERCATION_FRAME_BUFFER) == ALTERCATION_FRAME_BUFFER.maxlen
+            and (sum(ALTERCATION_FRAME_BUFFER) / len(ALTERCATION_FRAME_BUFFER)) >= ALTERCATION_CONFIRM_RATIO
+        )
 
-                if not in_z1 and not in_z2 and PASSENGER_REGISTRY[pid]["exit_z1"] is not None and PASSENGER_REGISTRY[pid]["exit_z2"] is None:
-                    PASSENGER_REGISTRY[pid]["exit_z2"] = current_time
-                    actual_proc = (PASSENGER_REGISTRY[pid]["exit_z2"] - PASSENGER_REGISTRY[pid]["exit_z1"]) * 30 / 60
-                    HISTORICAL_PROCESSING_TIMES.append(actual_proc)
+        current_queue_density = len(persons_this_frame)
+        active_wait_minutes = [
+            (current_time - record["first_seen"]) / 60 for record in PASSENGER_REGISTRY.values()
+        ]
+        final_avg_wait = float(np.mean(active_wait_minutes)) if active_wait_minutes else 0.0
+        final_avg_dwell = float(np.mean(HISTORICAL_DWELL_TIMES)) if HISTORICAL_DWELL_TIMES else 0.0
 
-        final_avg_wait = np.mean(HISTORICAL_WAIT_TIMES) if HISTORICAL_WAIT_TIMES else 0.0
-        final_avg_proc = np.mean(HISTORICAL_PROCESSING_TIMES) if HISTORICAL_PROCESSING_TIMES else 0.0
-
-        trend_status, trend_cycles = analyze_processing_trend(final_avg_proc)
+        trend_status, trend_cycles = analyze_processing_trend(final_avg_dwell)
         accumulation_rate = calculate_accumulation_rate(current_time)
 
         detected_incident = None
-        if zone_1_luggage_count > 0 and final_avg_proc > 4.0 and zone_1_people_count > 0:
-            detected_incident = "SUSPECTED_LUGGAGE_DISPUTE"
+        if altercation_confirmed:
+            detected_incident = "SUSPECTED_PHYSICAL_ALTERCATION"
         elif final_avg_wait > 12.0:
             detected_incident = "MEDICAL_EMERGENCY"
 
         metrics_payload = {
             "current_queue_density": current_queue_density,
             "avg_wait_time_minutes": round(final_avg_wait, 1),
-            "avg_processing_time_minutes": round(final_avg_proc, 1),
+            "avg_processing_time_minutes": round(final_avg_dwell, 1),
             "accumulation_rate_per_min": round(accumulation_rate, 2),
             "luggage_stationary_threshold_minutes": LUGGAGE_STATIONARY_THRESHOLD_MINUTES,
-            "zone_analysis": {
-                "zone_1_name": "WAITING_AREA",
-                "zone_2_name": "CHECK_IN_AREA",
-                "zone_1_people_count": zone_1_people_count,
-                "zone_2_people_count": zone_2_people_count,
-                "zone_1_luggage_count": zone_1_luggage_count,
-            },
+            "luggage_stationary_count": zone_1_luggage_count,
+            "altercation_detected": altercation_confirmed,
             "trend_analysis": {
                 "proc_time_slope": trend_status,
                 "consecutive_cycles_of_increase": trend_cycles
@@ -328,16 +378,11 @@ def run_vision_pipeline(video_source="video2.mp4"):
             "system_timestamp": current_time
         }
 
-        if zone_1_luggage_count > 0 and final_avg_proc > 4.0 and zone_1_people_count > 0:
-            metrics_payload["trigger_incident"] = "SUSPECTED_LUGGAGE_DISPUTE"
-
         with open(OUTPUT_PATH, "w") as f:
             json.dump(metrics_payload, f, indent=4)
 
         render_frame = results[0].plot()
-        cv2.polylines(render_frame, [zone_1], True, (0, 255, 0), 2)
-        cv2.polylines(render_frame, [zone_2], True, (255, 0, 0), 2)
-        draw_zone_labels(render_frame, zone_1, zone_2, zone_1_people_count, zone_2_people_count)
+        draw_altercation_overlay(render_frame, current_queue_density, altercation_confirmed)
 
         cv2.imwrite(FRAME_OUTPUT_PATH, render_frame)
 
@@ -347,6 +392,7 @@ def run_vision_pipeline(video_source="video2.mp4"):
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     run_vision_pipeline()
