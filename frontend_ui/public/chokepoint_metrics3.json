@@ -1,0 +1,20 @@
+{
+    "current_queue_density": 2,
+    "avg_wait_time_minutes": 0.0,
+    "avg_processing_time_minutes": 0.0,
+    "accumulation_rate_per_min": 1.23,
+    "luggage_stationary_threshold_minutes": 10,
+    "zone_analysis": {
+        "zone_1_name": "WAITING_AREA",
+        "zone_2_name": "CHECK_IN_AREA",
+        "zone_1_people_count": 2,
+        "zone_2_people_count": 0,
+        "zone_1_luggage_count": 2
+    },
+    "trend_analysis": {
+        "proc_time_slope": "STABLE",
+        "consecutive_cycles_of_increase": 0
+    },
+    "trigger_incident": null,
+    "system_timestamp": 1783819833.9510753
+}

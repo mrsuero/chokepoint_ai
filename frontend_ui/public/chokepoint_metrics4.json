@@ -1,0 +1,15 @@
+{
+    "current_queue_density": 2,
+    "avg_wait_time_minutes": 1.2,
+    "avg_processing_time_minutes": 0.3,
+    "accumulation_rate_per_min": 0.81,
+    "luggage_stationary_threshold_minutes": 10,
+    "luggage_stationary_count": 0,
+    "altercation_detected": true,
+    "trend_analysis": {
+        "proc_time_slope": "STABLE",
+        "consecutive_cycles_of_increase": 0
+    },
+    "trigger_incident": "SUSPECTED_PHYSICAL_ALTERCATION",
+    "system_timestamp": 1783819833.8791647
+}

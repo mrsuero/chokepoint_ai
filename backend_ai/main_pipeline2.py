@@ -24,7 +24,7 @@ TOTAL_PASSENGERS_ENTERED = 0
 SYSTEM_START_TIME = time.time()
 
 # Target data paths directly inside the Frontend public repository
-OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
+OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics2.json")
 FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame2.jpg")
 
 # === TOẠ ĐỘ ZONE (đã calibrate thực tế bằng get_coords.py) ===

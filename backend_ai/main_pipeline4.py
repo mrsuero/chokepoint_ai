@@ -24,8 +24,8 @@ TOTAL_PASSENGERS_ENTERED = 0
 SYSTEM_START_TIME = time.time()
 
 # Target data paths directly inside the Frontend public repository
-OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics.json")
-FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame3.jpg")
+OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "chokepoint_metrics4.json")
+FRAME_OUTPUT_PATH = os.path.join("..", "frontend_ui", "public", "current_frame4.jpg")
 
 LUGGAGE_LABELS = {"backpack", "handbag", "suitcase"}
 LUGGAGE_STATIONARY_THRESHOLD_MINUTES = 10
@@ -41,32 +41,92 @@ LUGGAGE_TRACKER = {}
 #   1) Đo khoảng cách CẠNH-VỚI-CẠNH giữa 2 bbox (không phải tâm-với-tâm) để
 #      biết 2 người có đang trong tầm với/đá của nhau hay không - chính xác
 #      hơn nhiều so với khoảng cách tâm khi 2 người đứng đối mặt tầm sải tay.
+#      NGƯỠNG NÀY GIỜ LÀ TƯƠNG ĐỐI (tỉ lệ theo chiều rộng bbox trung bình),
+#      KHÔNG còn là số px cố định - vì px cố định (40px) chỉ đúng khi camera
+#      đứng ở đúng 1 khoảng cách/zoom cụ thể lúc tune. Camera đặt xa hơn,
+#      hoặc người đứng xa ống kính hơn, bbox sẽ nhỏ hơn nên 40px thực tế lại
+#      là khoảng cách RẤT XA so với kích thước người -> luôn bị coi là "không
+#      trong tầm với nhau" dù 2 người đang đứng sát/đấm nhau thật, dẫn tới bỏ
+#      sót cảnh ẩu đả (đây chính là lý do camera 4 không cảnh báo dù 2 người
+#      đứng gần nhau rõ ràng trong khung hình).
 #   2) Đo mức "phình/co" của bbox (width, height) qua từng frame. Khi tay/chân
 #      vươn ra đấm/đá, bbox người sẽ phình rộng đột ngột dù tâm không đổi -
 #      đây là tín hiệu tốt hơn nhiều để bắt cử động chi so với tâm bbox.
 #   3) Kết hợp cả 2 tín hiệu trên, xác nhận qua nhiều frame liên tiếp để giảm
 #      báo nhầm khi chỉ là nhiễu detection thoáng qua.
-ALTERCATION_EDGE_GAP_PX = 40           # 2 bbox được coi là "trong tầm với nhau" nếu khoảng cách cạnh-với-cạnh dưới ngưỡng này
-ALTERCATION_MOTION_PX = 14             # biến động (tâm di chuyển HOẶC kích thước bbox thay đổi) mỗi frame để coi là "cử động mạnh"
-ALTERCATION_FRAME_WINDOW = 20          # số frame gần nhất dùng để xác nhận, giảm false positive tức thời
-ALTERCATION_CONFIRM_RATIO = 0.4        # tỉ lệ frame "nghi vấn" trong window để xác nhận là ẩu đả thật
+ALTERCATION_EDGE_GAP_RATIO = 1.2       # 2 bbox được coi là "trong tầm với nhau" nếu khoảng cách cạnh-với-cạnh
+                                        # nhỏ hơn 1.2 lần chiều rộng bbox trung bình của 2 người (tự scale theo
+                                        # khoảng cách camera/zoom, không hardcode px)
+ALTERCATION_MOTION_STRONG_PX = 9        # ngưỡng "cử động mạnh" cho ít nhất 1 người trong cặp (người ra đòn)
+ALTERCATION_MOTION_MIN_PX = 3            # ngưỡng "có cử động" tối thiểu cho người còn lại (không đứng yên tuyệt đối)
+ALTERCATION_FRAME_WINDOW = 12            # số frame gần nhất dùng để xác nhận, giảm false positive tức thời (rút ngắn để confirm nhanh hơn cho demo)
+ALTERCATION_CONFIRM_RATIO = 0.3          # tỉ lệ frame "nghi vấn" trong window để xác nhận là ẩu đả thật
+ALTERCATION_DEBUG_LOG = True           # bật log debug để xem gap/motion thực tế - tắt (False) khi lên production
 
 PERSON_MOTION_TRACKER = {}             # pid -> {"prev_center", "prev_size": (w, h), "motion_history": deque}
 ALTERCATION_FRAME_BUFFER = deque(maxlen=ALTERCATION_FRAME_WINDOW)
 
+# --- GHOST TRACKING ---
+# Lúc 2 người đứng sát nhau để đấm/đá, chính là lúc detector DỄ MẤT TRACK 1
+# trong 2 người nhất (bbox chồng lấn bị NMS loại bớt, motion blur làm tụt
+# confidence, occlusion khiến ByteTrack rớt ID). Nếu chỉ so sánh cặp người
+# trong `persons_this_frame` (tức chỉ những ai được detect THÀNH CÔNG ở đúng
+# frame đó), ta sẽ bỏ sót gần hết các frame quan trọng nhất. Ghost tracking
+# giữ lại vị trí bbox cuối cùng đã biết của 1 người trong một khoảng thời
+# gian ngắn sau khi mất track, để logic phát hiện ẩu đả vẫn có đủ dữ liệu
+# vị trí mà so sánh, thay vì coi như người đó biến mất hoàn toàn.
+GHOST_TIMEOUT_SECONDS = 0.6            # giữ vị trí cuối cùng của người mất track trong tối đa 0.6s
+GHOST_TRACKER = {}                     # pid -> {"box", "center", "last_seen": current_time}
 
-def box_edge_gap(box_a, box_b):
+
+def build_persons_for_altercation(persons_this_frame, current_time):
     """
-    Khoảng cách cạnh-với-cạnh giữa 2 bounding box (x1, y1, x2, y2).
-    Trả về 0 nếu 2 box chồng lấn nhau (đang chạm/gần như chạm).
+    Trả về danh sách người dùng để xét ẩu đả, gồm:
+      - Tất cả người đang được detect thật sự ở frame hiện tại.
+      - Cộng thêm những người vừa mất track trong vòng GHOST_TIMEOUT_SECONDS
+        gần nhất, dùng vị trí bbox cuối cùng đã biết của họ ("ghost").
+    Đồng thời cập nhật GHOST_TRACKER và dọn các ghost đã quá hạn.
+    """
+    active_ids = set()
+    combined = list(persons_this_frame)
+
+    for pid, center, box in persons_this_frame:
+        active_ids.add(pid)
+        GHOST_TRACKER[pid] = {"box": box, "center": center, "last_seen": current_time}
+
+    for pid in list(GHOST_TRACKER.keys()):
+        if pid in active_ids:
+            continue
+        ghost = GHOST_TRACKER[pid]
+        age = current_time - ghost["last_seen"]
+        if age > GHOST_TIMEOUT_SECONDS:
+            del GHOST_TRACKER[pid]
+            continue
+        combined.append((pid, ghost["center"], ghost["box"]))
+
+    return combined
+
+
+def box_edge_gap_relative(box_a, box_b):
+    """
+    Khoảng cách cạnh-với-cạnh giữa 2 bounding box (x1, y1, x2, y2), CHUẨN HÓA
+    theo chiều rộng bbox trung bình của 2 người thay vì trả về số px thô.
+    Trả về tỉ lệ: 0 = 2 box chồng lấn/chạm nhau, 1.0 = khoảng cách bằng đúng
+    1 chiều rộng người trung bình. Nhờ vậy ngưỡng "trong tầm với nhau" không
+    còn phụ thuộc vào khoảng cách đặt camera hay độ phân giải video.
     """
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
 
     gap_x = max(0.0, max(ax1, bx1) - min(ax2, bx2))
     gap_y = max(0.0, max(ay1, by1) - min(ay2, by2))
+    raw_gap_px = (gap_x ** 2 + gap_y ** 2) ** 0.5
 
-    return (gap_x ** 2 + gap_y ** 2) ** 0.5
+    avg_width = ((ax2 - ax1) + (bx2 - bx1)) / 2
+    if avg_width <= 0:
+        return raw_gap_px, raw_gap_px
+
+    return raw_gap_px / avg_width, raw_gap_px
 
 
 def calculate_accumulation_rate(current_time):
@@ -135,8 +195,8 @@ def detect_altercation_candidate(persons_this_frame):
     """
     persons_this_frame: list of (pid, center, box) cho tất cả người phát hiện được trong frame hiện tại.
     Trả về True nếu có ít nhất 1 cặp người vừa trong tầm với nhau (khoảng cách
-    cạnh-với-cạnh, không phải tâm-với-tâm) VỪA có cử động mạnh/đột ngột đồng
-    thời (thân hoặc chi) - dấu hiệu nghi vấn xô xát/đấm nhau.
+    cạnh-với-cạnh TƯƠNG ĐỐI, không phải px cố định) VỪA có cử động mạnh/đột
+    ngột đồng thời (thân hoặc chi) - dấu hiệu nghi vấn xô xát/đấm nhau.
     """
     motion_scores = {pid: update_person_motion(pid, center, box) for pid, center, box in persons_this_frame}
 
@@ -145,10 +205,31 @@ def detect_altercation_candidate(persons_this_frame):
         for j in range(i + 1, len(persons_this_frame)):
             pid_b, _, box_b = persons_this_frame[j]
 
-            if box_edge_gap(box_a, box_b) > ALTERCATION_EDGE_GAP_PX:
+            gap_ratio, gap_px = box_edge_gap_relative(box_a, box_b)
+
+            in_reach = gap_ratio <= ALTERCATION_EDGE_GAP_RATIO
+            score_a = motion_scores[pid_a]
+            score_b = motion_scores[pid_b]
+            # Bất đối xứng: chỉ cần 1 trong 2 người có cử động MẠNH (người ra đòn),
+            # người còn lại chỉ cần có cử động TỐI THIỂU (không đứng yên tuyệt đối
+            # như 1 người đứng chờ hàng cạnh người khác) - vì lúc đấm/đá, người đỡ
+            # đòn hoặc lùi/né thường cử động ít hơn nhiều so với người tung đòn.
+            strong_motion = (
+                (score_a >= ALTERCATION_MOTION_STRONG_PX and score_b >= ALTERCATION_MOTION_MIN_PX) or
+                (score_b >= ALTERCATION_MOTION_STRONG_PX and score_a >= ALTERCATION_MOTION_MIN_PX)
+            )
+
+            if ALTERCATION_DEBUG_LOG:
+                print(f"[ALTERCATION_DEBUG] pair=({pid_a},{pid_b}) gap_px={gap_px:.1f} "
+                      f"gap_ratio={gap_ratio:.2f} (limit={ALTERCATION_EDGE_GAP_RATIO}) "
+                      f"motion_a={score_a:.1f} motion_b={score_b:.1f} "
+                      f"(strong_limit={ALTERCATION_MOTION_STRONG_PX} min_limit={ALTERCATION_MOTION_MIN_PX}) "
+                      f"in_reach={in_reach} strong_motion={strong_motion}")
+
+            if not in_reach:
                 continue
 
-            if motion_scores[pid_a] >= ALTERCATION_MOTION_PX and motion_scores[pid_b] >= ALTERCATION_MOTION_PX:
+            if strong_motion:
                 return True
 
     return False
@@ -226,7 +307,7 @@ def run_simulation_loop():
         time.sleep(1)
 
 
-def run_vision_pipeline(video_source="video3.mp4"):
+def run_vision_pipeline(video_source="video4.mp4"):
     global TOTAL_PASSENGERS_ENTERED
 
     # Cơ chế tự động quét thông minh: Check thư mục hiện tại trước, nếu không thấy thì check thư mục cha
@@ -337,9 +418,14 @@ def run_vision_pipeline(video_source="video3.mp4"):
                 HISTORICAL_DWELL_TIMES.append(dwell_minutes)
                 del PASSENGER_REGISTRY[pid]
                 PERSON_MOTION_TRACKER.pop(pid, None)
+                GHOST_TRACKER.pop(pid, None)
 
         # --- Phát hiện ẩu đả / đấm nhau (thay cho logic chia zone) ---
-        altercation_candidate = detect_altercation_candidate(persons_this_frame)
+        # Dùng persons_for_altercation (có ghost) thay vì persons_this_frame
+        # để không bỏ sót cặp đấm nhau khi 1 người bị mất track tạm thời do
+        # bbox chồng lấn/motion blur đúng lúc va chạm.
+        persons_for_altercation = build_persons_for_altercation(persons_this_frame, current_time)
+        altercation_candidate = detect_altercation_candidate(persons_for_altercation)
         ALTERCATION_FRAME_BUFFER.append(altercation_candidate)
         altercation_confirmed = (
             len(ALTERCATION_FRAME_BUFFER) == ALTERCATION_FRAME_BUFFER.maxlen

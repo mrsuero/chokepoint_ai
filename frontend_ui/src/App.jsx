@@ -4,13 +4,14 @@ import AdminDashboard from './components/AdminDashboard';
 
 // Cấu hình 4 camera hiển thị song song. Mỗi camera có đường dẫn ảnh riêng
 // (backend cần ghi ra current_frame1.jpg / _2.jpg / _3.jpg / _4.jpg tương ứng)
-// và tốc độ refresh riêng (offsetMs để timer từng camera lệch nhau,
+// và giờ có thêm đường dẫn metrics riêng (chokepoint_metrics1.json / 2 / 3 / 4),
+// cùng tốc độ refresh riêng (offsetMs để timer từng camera lệch nhau,
 // tránh cả 4 cùng fetch dồn dập vào đúng 1 thời điểm).
 const CAMERA_CONFIGS = [
-  { id: 1, label: 'CHECKPOINT_CAMERA_01', framePath: '/current_frame1.jpg', intervalMs: 100, offsetMs: 0 },
-  { id: 2, label: 'CHECKPOINT_CAMERA_02', framePath: '/current_frame2.jpg', intervalMs: 100, offsetMs: 25 },
-  { id: 3, label: 'CHECKPOINT_CAMERA_03', framePath: '/current_frame3.jpg', intervalMs: 100, offsetMs: 50 },
-  { id: 4, label: 'CHECKPOINT_CAMERA_04', framePath: '/current_frame4.jpg', intervalMs: 100, offsetMs: 75 },
+  { id: 1, label: 'CHECKPOINT_CAMERA_01', framePath: '/current_frame1.jpg', metricsPath: '/chokepoint_metrics1.json', intervalMs: 100, offsetMs: 0 },
+  { id: 2, label: 'CHECKPOINT_CAMERA_02', framePath: '/current_frame2.jpg', metricsPath: '/chokepoint_metrics2.json', intervalMs: 100, offsetMs: 25 },
+  { id: 3, label: 'CHECKPOINT_CAMERA_03', framePath: '/current_frame3.jpg', metricsPath: '/chokepoint_metrics3.json', intervalMs: 100, offsetMs: 50 },
+  { id: 4, label: 'CHECKPOINT_CAMERA_04', framePath: '/current_frame4.jpg', metricsPath: '/chokepoint_metrics4.json', intervalMs: 100, offsetMs: 75 },
 ];
 
 const FALLBACK_IMAGE = "https://images.unsplash.com/photo-1542296332-2e4473fac563?q=80&w=600&auto=format&fit=crop";
@@ -98,11 +99,9 @@ function MetricStat({ label, value, unit }) {
   );
 }
 
-// Khối metrics đi kèm mỗi camera. Backend hiện chỉ phát ra MỘT bộ metrics
-// tổng (chokepoint_metrics.json) chứ chưa tách riêng theo từng camera, nên
-// tạm thời cả 4 khối hiển thị cùng một nguồn dữ liệu, chỉ đổi nhãn theo
-// camera. Nếu backend sau này trả về field dạng metrics.cameras[id], chỉ
-// cần thay `metricsData` bên dưới bằng `metricsData?.cameras?.[config.id]`.
+// Khối metrics đi kèm mỗi camera. Giờ mỗi camera nhận metricsData RIÊNG
+// (đọc từ chokepoint_metrics{id}.json tương ứng), không còn dùng chung
+// 1 nguồn dữ liệu cho cả 4 camera nữa.
 function CameraMetricsPanel({ config, metricsData }) {
   const queueDensity = metricsData?.current_queue_density ?? '—';
   const avgWait = metricsData?.avg_wait_time_minutes ?? '—';
@@ -144,22 +143,42 @@ export default function App() {
   // System states
   const [currentRole, setCurrentRole] = useState('OPERATOR');
   const [systemState, setSystemState] = useState(null);
+  // metricsState giờ có dạng: { shared: {...}, byCameraId: { 1: {...}, 2: {...}, 3: {...}, 4: {...} } }
   const [metricsState, setMetricsState] = useState(null);
 
   // Poll system data structure context
   useEffect(() => {
     if (!isAuthenticated) return;
+
+    // Fetch an toàn: trả về null thay vì throw nếu file chưa tồn tại (404) hoặc lỗi mạng,
+    // để 1 camera thiếu file metrics không làm hỏng cả vòng lặp fetch.
+    const fetchJsonSafe = async (url) => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    };
+
     const fetchSystemState = async () => {
       try {
-        const [stateResponse, metricsResponse] = await Promise.all([
-          fetch('/agent_ui_state.json'),
-          fetch('/chokepoint_metrics.json'),
+        const [stateData, sharedMetrics, ...perCameraMetrics] = await Promise.all([
+          fetch('/agent_ui_state.json').then(r => r.json()),
+          fetchJsonSafe('/chokepoint_metrics.json'), // fallback dùng chung, phòng khi file riêng của camera nào đó chưa sẵn sàng
+          ...CAMERA_CONFIGS.map(cfg => fetchJsonSafe(cfg.metricsPath)),
         ]);
-        const stateData = await stateResponse.json();
-        const metricsData = await metricsResponse.json();
 
         setSystemState(stateData);
-        setMetricsState(metricsData);
+
+        // Gộp thành object theo camera id: { [id]: metricsData }
+        const byCameraId = {};
+        CAMERA_CONFIGS.forEach((cfg, i) => {
+          byCameraId[cfg.id] = perCameraMetrics[i] ?? sharedMetrics; // fallback nếu file riêng lỗi/chưa có
+        });
+
+        setMetricsState({ shared: sharedMetrics, byCameraId });
 
         if (stateData.severity) {
           // Sync role securely with backend recommendations if preferred
@@ -169,6 +188,7 @@ export default function App() {
       }
     };
 
+    fetchSystemState();
     const interval = setInterval(fetchSystemState, 1000);
     return () => clearInterval(interval);
   }, [isAuthenticated]);
@@ -299,26 +319,26 @@ export default function App() {
       )}
 
       <main className="p-6 space-y-6">
-        {/* 4 hàng: mỗi hàng = 1 camera + metrics của chính camera đó, đúng như bảng yêu cầu */}
+        {/* 4 hàng: mỗi hàng = 1 camera + metrics RIÊNG của chính camera đó (chokepoint_metrics{id}.json) */}
         <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-4 divide-y divide-slate-800">
           {CAMERA_CONFIGS.map((config, index) => (
             <CameraRow
               key={config.id}
               config={config}
               severity={systemState.severity}
-              metricsData={metricsState}
+              metricsData={metricsState?.byCameraId?.[config.id]}
               isLast={index === CAMERA_CONFIGS.length - 1}
             />
           ))}
         </div>
 
-        {/* AI Insights & Directives, giữ nguyên bên dưới bảng camera/metrics */}
+        {/* AI Insights & Directives, giữ nguyên bên dưới bảng camera/metrics - dùng metrics tổng (shared) */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-3">
             {currentRole === 'OPERATOR' ? (
-              <OperatorDashboard viewData={systemState.operator_view} severity={systemState.severity} metricsData={metricsState} />
+              <OperatorDashboard viewData={systemState.operator_view} severity={systemState.severity} metricsData={metricsState?.shared} />
             ) : (
-              <AdminDashboard viewData={systemState.admin_view} severity={systemState.severity} dispatchMode={systemState.dispatch_mode} metricsData={metricsState} />
+              <AdminDashboard viewData={systemState.admin_view} severity={systemState.severity} dispatchMode={systemState.dispatch_mode} metricsData={metricsState?.shared} />
             )}
           </div>
         </div>
